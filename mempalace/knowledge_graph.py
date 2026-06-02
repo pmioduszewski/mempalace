@@ -357,6 +357,71 @@ class KnowledgeGraph:
                     (ended, sub_id, pred, obj_id),
                 )
 
+    # ── Supersedence helpers ──────────────────────────────────────────────
+
+    def mark_superseded(
+        self,
+        old: str,
+        new: str,
+        reason: str = None,
+        when: str = None,
+    ) -> None:
+        """Record that entity *old* has been superseded by entity *new*.
+
+        Inserts a ``(old, "superseded_by", new)`` triple (live, valid_to=None)
+        and, when *reason* is given, a companion ``(new, "supersedes_reason",
+        reason)`` triple — both stored as ordinary predicates in the existing
+        ``triples`` table (no schema change).
+
+        *when* sets ``valid_from`` on the superseded_by triple; defaults to
+        today.
+        """
+        valid_from = sanitize_iso_temporal(when, "when") or date.today().isoformat()
+        self.add_triple(old, "superseded_by", new, valid_from=valid_from)
+        if reason is not None:
+            self.add_triple(new, "supersedes_reason", reason, valid_from=valid_from)
+
+    def current_supersessions(self) -> dict:
+        """Return live supersedence records as ``{old_id: {"new": name, "reason": str|None}}``.
+
+        Queries all ``superseded_by`` triples with ``valid_to IS NULL``,
+        resolves entity names via the ``entities`` join, and looks up the
+        paired ``supersedes_reason`` triple for each successor.  Keys are the
+        lower-case entity ids (mirrors ``_entity_id``).
+        """
+        query = """
+            SELECT t.subject, t.object,
+                   s.name AS sub_name, o.name AS obj_name
+            FROM triples t
+            JOIN entities s ON t.subject = s.id
+            JOIN entities o ON t.object = o.id
+            WHERE t.predicate = 'superseded_by' AND t.valid_to IS NULL
+        """
+        with self._lock:
+            conn = self._conn()
+            rows = conn.execute(query).fetchall()
+
+            result = {}
+            for row in rows:
+                old_id = row["subject"]
+                new_name = row["obj_name"]
+                new_id = row["object"]
+
+                # Look up the companion supersedes_reason triple (best-effort).
+                reason_row = conn.execute(
+                    "SELECT o.name AS reason_name FROM triples t "
+                    "JOIN entities o ON t.object = o.id "
+                    "WHERE t.subject = ? AND t.predicate = 'supersedes_reason' "
+                    "AND t.valid_to IS NULL "
+                    "ORDER BY t.extracted_at DESC LIMIT 1",
+                    (new_id,),
+                ).fetchone()
+                reason = reason_row["reason_name"] if reason_row else None
+
+                result[old_id] = {"new": new_name, "reason": reason}
+
+        return result
+
     # ── Query operations ──────────────────────────────────────────────────
 
     def query_entity(self, name: str, as_of: str = None, direction: str = "outgoing"):

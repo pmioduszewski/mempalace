@@ -609,9 +609,15 @@ def list_tunnels(wing: str = None):
 
     Returns tunnels where ``wing`` appears as either source or target
     (tunnels are symmetric, so either endpoint is a valid filter match).
+
+    ``supersedes`` edges (``kind="supersedes"``) are intentionally excluded —
+    they are directed predecessor→successor links and are only accessible via
+    :func:`list_supersedence`.  Including them here would expose records that
+    lack ``source``/``target`` keys, which causes ``KeyError`` for callers
+    that iterate the returned list expecting standard tunnel fields.
     """
     norm_wing = _normalize_wing(wing)
-    tunnels = _load_tunnels()
+    tunnels = [t for t in _load_tunnels() if t.get("kind") != "supersedes"]
     if norm_wing:
         # Normalize stored wings too: older tunnels.json records hold the
         # underscore form (from the prior write-path normalization), while
@@ -635,6 +641,78 @@ def delete_tunnel(tunnel_id: str):
         tunnels = [t for t in tunnels if t.get("id") != tunnel_id]
         _save_tunnels(tunnels)
     return {"deleted": tunnel_id}
+
+
+# =============================================================================
+# SUPERSEDENCE EDGES — directed predecessor→successor links
+# =============================================================================
+
+
+def _directed_supersedes_id(pred_drawer_id: str, succ_drawer_id: str) -> str:
+    raw = f"sup||{pred_drawer_id}→{succ_drawer_id}"
+    return "sup_" + hashlib.sha256(raw.encode()).hexdigest()[:12]
+
+
+def create_supersedence(
+    pred_wing,
+    pred_room,
+    pred_drawer_id,
+    succ_wing,
+    succ_room,
+    succ_drawer_id,
+    reason="",
+    created_by="iga",
+    confidence=1.0,
+):
+    """Directed predecessor→successor edge stored in tunnels.json (kind=supersedes)."""
+    pred_wing = _require_name(pred_wing, "pred_wing")
+    succ_wing = _require_name(succ_wing, "succ_wing")
+    pred_drawer_id = _require_name(pred_drawer_id, "pred_drawer_id")
+    succ_drawer_id = _require_name(succ_drawer_id, "succ_drawer_id")
+    config = MempalaceConfig()
+    edge_id = _directed_supersedes_id(pred_drawer_id, succ_drawer_id)
+    edge = {
+        "id": edge_id,
+        "kind": "supersedes",
+        "predecessor": {"wing": pred_wing, "room": pred_room, "drawer_id": pred_drawer_id},
+        "successor": {"wing": succ_wing, "room": succ_room, "drawer_id": succ_drawer_id},
+        "reason": reason,
+        "created_by": created_by,
+        "confidence": confidence,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    with mine_lock(_get_tunnel_file(config)):
+        tunnels = _load_tunnels(config)
+        for existing in tunnels:
+            if existing.get("id") == edge_id:
+                edge["created_at"] = existing.get("created_at", edge["created_at"])
+                edge["updated_at"] = datetime.now(timezone.utc).isoformat()
+                existing.clear()
+                existing.update(edge)
+                _save_tunnels(tunnels, config)
+                return existing
+        tunnels.append(edge)
+        _save_tunnels(tunnels, config)
+    return edge
+
+
+def list_supersedence(drawer_id: str, direction: str = "both", config=None) -> dict:
+    """Return {superseded_by:[outgoing edges], supersedes:[incoming edges]} for a drawer."""
+    out: dict = {"superseded_by": [], "supersedes": []}
+    for t in _load_tunnels(config):
+        if t.get("kind") != "supersedes":
+            continue
+        if (t.get("predecessor") or {}).get("drawer_id") == drawer_id and direction in (
+            "both",
+            "outgoing",
+        ):
+            out["superseded_by"].append(t)
+        if (t.get("successor") or {}).get("drawer_id") == drawer_id and direction in (
+            "both",
+            "incoming",
+        ):
+            out["supersedes"].append(t)
+    return out
 
 
 def follow_tunnels(wing: str, room: str, col=None, config=None):

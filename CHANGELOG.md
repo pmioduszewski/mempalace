@@ -6,6 +6,64 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [3.3.6+sup.1] — fork: supersedence (anti-staleness)
+
+> Fork-local release on branch `feat/supersedence`. Adds two cooperating levels of
+> anti-staleness: drawer-level hard-suppression and entity-level annotation.
+> **One intentional behavior change** (see Breaking Changes below).
+
+### Breaking Changes
+
+- **`mempalace_search` now hides superseded drawers by default.** Drawers whose
+  metadata `status == "superseded"` are filtered out of every search result unless
+  `include_superseded=True` is passed. This is the only default-behavior change —
+  all other additions are strictly additive. Pass `include_superseded=True` to
+  restore the previous behavior.
+
+### Features
+
+- **Drawer-level supersedence.** `mempalace_add_drawer` gains two optional
+  parameters: `supersedes_drawer_id` (ID of the predecessor drawer to retire) and
+  `supersedes_reason` (human-readable rationale). When set, the predecessor's
+  metadata is patched with `status: "superseded"`, `superseded_at`, and
+  `superseded_by_id`; a directed `supersedes` tunnel edge is written to
+  `tunnels.json`. A warning (no error) is returned if the predecessor is not found.
+
+- **`mempalace_mark_superseded` tool (new).** Mark two existing drawers as
+  predecessor → successor after the fact, without re-adding content.
+
+- **`mempalace_list_supersedence` tool (new).** Query supersedence edges for any
+  drawer in both directions: which drawers it supersedes and which supersede it.
+
+- **`drawer_id` and `state` on every search result row.** Every row returned by
+  `mempalace_search` now includes `drawer_id` (the ChromaDB document ID) and
+  `state` (`"current"` or `"superseded"`). Superseded rows also carry
+  `superseded_by` / `supersedes` compact sub-dicts when backref edges exist.
+
+- **Entity-level supersedence annotation.** `mempalace_kg_invalidate` gains two
+  optional parameters: `successor_subject` and `successor_reason`. When set, a
+  `superseded_by` KG triple is recorded alongside the invalidation. At search time,
+  each result row's text is scanned for KG-superseded entity names; matches add a
+  `superseded_entities: [{old, new, reason}]` annotation so the consuming LLM can
+  discount stale references. Annotation is bounded (≤200 KG entries checked,
+  ≤5 annotations per row, 1 extra sqlite read per search).
+
+- **`current_supersessions()` on `KnowledgeGraph`.** Returns a dict of all live
+  `superseded_by` triples keyed by old entity name (lowercased), each with `new`
+  and `reason`. Used internally by the searcher; also available for direct use.
+
+- **`follow_supersedes` search param.** `mempalace_search` and `search_memories`
+  accept `follow_supersedes=True` (default) to attach backref annotations to
+  surviving successor rows.
+
+### No Schema Changes
+
+All new data lives in existing stores: `supersedes` edges are a new `kind` in the
+existing `tunnels.json`; `superseded_by` / `supersedes_reason` are ordinary
+predicates in the existing `triples` table. No migrations required.
+
+---
+
 ## [3.3.6] — 2026-05-24
 
 ### Features

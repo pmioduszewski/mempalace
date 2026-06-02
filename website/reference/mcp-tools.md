@@ -332,6 +332,35 @@ Follow tunnels from a room to see what it connects to in other wings. Returns co
 
 ---
 
+## Supersedence Tools
+
+### `mempalace_mark_superseded`
+
+Mark one drawer as superseding another, recording a directed predecessor→successor edge. Patches the predecessor's metadata with `status: "superseded"` and creates a `supersedes` tunnel edge so search hides the old drawer by default.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `old_drawer_id` | string | **Yes** | Drawer ID of the predecessor (stale fact) |
+| `new_drawer_id` | string | **Yes** | Drawer ID of the successor (current fact) |
+| `reason` | string | No | Human-readable reason for the supersedence |
+
+**Returns:** `{ id, kind: "supersedes", predecessor, successor, reason, created_at }`
+
+---
+
+### `mempalace_list_supersedence`
+
+List all supersedence edges for a given drawer, in both directions: which drawers it supersedes and which drawers supersede it.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `drawer_id` | string | **Yes** | Drawer ID to query |
+| `direction` | string | No | `"both"` (default), `"outgoing"`, or `"incoming"` |
+
+**Returns:** `{ superseded_by: [...], supersedes: [...] }`
+
+---
+
 ## Agent Diary Tools
 
 ### `mempalace_diary_write`

@@ -929,3 +929,73 @@ class TestTunnelDynamicsIntegration:
         assert recreated["stability"] == DEFAULT_STABILITY
         assert recreated["access_count"] == 0
         assert "last_activated" in recreated
+
+
+# ── #5: list_tunnels must not leak supersedes edges ───────────────────────────
+
+
+class TestListTunnelsDoesNotLeakSupersedes:
+    """``list_tunnels()`` must exclude ``kind=supersedes`` edges.
+
+    Supersedes edges lack ``source``/``target`` keys; returning them from
+    ``list_tunnels`` causes KeyError on callers that iterate the list
+    expecting standard tunnel fields.
+    """
+
+    def test_list_tunnels_excludes_supersedes_edges(self, tmp_path, monkeypatch):
+        """list_tunnels returns only non-supersedes entries even when the file
+        contains supersedes edges."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        # Create a normal explicit tunnel.
+        palace_graph.create_tunnel("wing_a", "room_1", "wing_b", "room_2", label="explicit")
+
+        # Directly inject a supersedes edge (no source/target keys).
+        raw = palace_graph._load_tunnels()
+        raw.append(
+            {
+                "id": "sup_abc123",
+                "kind": "supersedes",
+                "predecessor": {"wing": "wing_a", "room": "room_1", "drawer_id": "d_old"},
+                "successor": {"wing": "wing_a", "room": "room_1", "drawer_id": "d_new"},
+                "reason": "rebrand",
+                "created_at": "2026-06-01T00:00:00+00:00",
+            }
+        )
+        palace_graph._save_tunnels(raw)
+
+        tunnels = palace_graph.list_tunnels()
+        # The explicit tunnel must be present.
+        assert len(tunnels) == 1, f"expected 1 tunnel, got {len(tunnels)}: {tunnels}"
+        # No supersedes edge must leak through.
+        assert all(t.get("kind") != "supersedes" for t in tunnels), (
+            f"supersedes edge leaked into list_tunnels result: {tunnels}"
+        )
+        # Iterating standard fields must not raise.
+        for t in tunnels:
+            _ = t["source"]["wing"]
+            _ = t["target"]["wing"]
+
+    def test_list_tunnels_wing_filter_excludes_supersedes(self, tmp_path, monkeypatch):
+        """Wing filter on list_tunnels must also not return supersedes edges."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        palace_graph.create_tunnel("wing_a", "room_1", "wing_b", "room_2", label="explicit")
+
+        raw = palace_graph._load_tunnels()
+        raw.append(
+            {
+                "id": "sup_xyz",
+                "kind": "supersedes",
+                "predecessor": {"wing": "wing_a", "room": "room_1", "drawer_id": "d_old"},
+                "successor": {"wing": "wing_a", "room": "room_1", "drawer_id": "d_new"},
+                "created_at": "2026-06-01T00:00:00+00:00",
+            }
+        )
+        palace_graph._save_tunnels(raw)
+
+        # Filter by wing_a — must not KeyError on the supersedes edge.
+        tunnels = palace_graph.list_tunnels("wing_a")
+        assert all(t.get("kind") != "supersedes" for t in tunnels)
+        for t in tunnels:
+            _ = t["source"]["wing"]

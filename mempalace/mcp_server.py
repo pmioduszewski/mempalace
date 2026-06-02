@@ -74,6 +74,7 @@ from .backends.chroma import (  # noqa: E402
 )
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import search_memories  # noqa: E402
+from . import palace_graph  # noqa: E402  (module ref needed for monkeypatching in tests)
 from .palace_graph import (  # noqa: E402
     traverse,
     find_tunnels,
@@ -882,6 +883,8 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    include_superseded: bool = False,
+    follow_supersedes: bool = True,
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -909,6 +912,8 @@ def tool_search(
         max_distance=dist,
         vector_disabled=_vector_disabled,
         collection_name=_config.collection_name,
+        include_superseded=include_superseded,
+        follow_supersedes=follow_supersedes,
     )
     if _is_transient_index_error(result):
         # Post-bulk-write HNSW flush window (#1315): drop caches, give
@@ -925,6 +930,8 @@ def tool_search(
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
+            include_superseded=include_superseded,
+            follow_supersedes=follow_supersedes,
         )
         if not _is_transient_index_error(result):
             result["index_recovered"] = True
@@ -1099,11 +1106,101 @@ def tool_follow_tunnels(wing: str, room: str):
     return follow_tunnels(wing, room, col=col)
 
 
+def tool_mark_superseded(old_drawer_id: str, new_drawer_id: str, reason: str = "") -> dict:
+    """Mark old_drawer_id as superseded by new_drawer_id; creates a directed edge."""
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+    # Verify both drawers exist.
+    for did in (old_drawer_id, new_drawer_id):
+        probe = col.get(ids=[did], include=[])
+        if not probe["ids"]:
+            return {"error": f"Drawer not found: {did}"}
+    edge_id, warning = _apply_drawer_supersedence(col, new_drawer_id, old_drawer_id, reason)
+    if warning:
+        return {"error": warning}
+    edges = palace_graph.list_supersedence(old_drawer_id, direction="outgoing", config=_config)
+    for edge in edges["superseded_by"]:
+        if edge.get("id") == edge_id:
+            return edge
+    return {"id": edge_id, "kind": "supersedes", "error": "edge created but not readable"}
+
+
+def tool_list_supersedence(drawer_id: str, direction: str = "both") -> dict:
+    """List supersedence edges for a drawer (both directions by default)."""
+    return palace_graph.list_supersedence(drawer_id, direction=direction, config=_config)
+
+
 # ==================== WRITE TOOLS ====================
 
 
+def _apply_drawer_supersedence(col, new_id: str, pred_id: str, reason: str):
+    """Create supersedence edge + patch predecessor metadata. Returns (edge_id_or_None, warning_or_None).
+
+    Also stamps ``status=superseded`` on any chunk rows whose
+    ``parent_drawer_id == pred_id`` so that oversized predecessors do not
+    leave their constituent chunks visible as "current" after supersedence.
+    """
+    try:
+        probe = col.get(ids=[pred_id], include=["metadatas"])
+        if not probe["ids"]:
+            return None, f"Predecessor drawer not found: {pred_id}; supersedence edge not created."
+        pred_meta = (probe["metadatas"] or [{}])[0] or {}
+        pred_wing = pred_meta.get("wing", "")
+        pred_room = pred_meta.get("room", "")
+        new_meta = col.get(ids=[new_id], include=["metadatas"])
+        new_meta_dict = (new_meta["metadatas"] or [{}])[0] or {} if new_meta["ids"] else {}
+        succ_wing = new_meta_dict.get("wing", pred_wing)
+        succ_room = new_meta_dict.get("room", pred_room)
+        edge = palace_graph.create_supersedence(
+            pred_wing,
+            pred_room,
+            pred_id,
+            succ_wing,
+            succ_room,
+            new_id,
+            reason=reason or "",
+        )
+        superseded_stamp = {
+            "status": "superseded",
+            "superseded_at": date.today().isoformat(),
+            "superseded_by_id": new_id,
+        }
+        merged_meta = {**pred_meta, **superseded_stamp}
+        col.update(ids=[pred_id], metadatas=[merged_meta])
+
+        # Stamp chunk rows for oversized predecessors.  Query by
+        # parent_drawer_id so we don't need to know the chunk count.
+        try:
+            chunk_results = col.get(
+                where={"parent_drawer_id": pred_id},
+                include=["metadatas"],
+            )
+            if chunk_results["ids"]:
+                chunk_metas = [
+                    {**(m or {}), **superseded_stamp} for m in chunk_results["metadatas"]
+                ]
+                col.update(ids=chunk_results["ids"], metadatas=chunk_metas)
+        except Exception as chunk_exc:
+            logger.debug(
+                "_apply_drawer_supersedence: chunk stamp failed for %s: %s",
+                pred_id,
+                chunk_exc,
+            )
+
+        return edge["id"], None
+    except Exception as exc:
+        return None, str(exc)
+
+
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    supersedes_drawer_id: str = None,
+    supersedes_reason: str = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
 
@@ -1193,48 +1290,60 @@ def tool_add_drawer(
                 )
             _metadata_cache = None
             logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
-            return {
+            result = {
                 "success": True,
                 "drawer_id": drawer_id,
                 "wing": wing,
                 "room": room,
                 "chunks": 1,
             }
+        else:
+            # Oversized content: split into bounded per-chunk drawers so the
+            # embedding model never sees a document above ``chunk_size``.
+            # Single batched ``upsert`` so the embedding pass either commits
+            # every chunk or none — no half-written palace if the embedding
+            # model fails mid-loop (#1539).
+            chunk_ids: list[str] = []
+            chunk_docs: list[str] = []
+            chunk_metas: list[dict] = []
+            for i in range(0, len(content), chunk_size):
+                chunk_idx = i // chunk_size
+                chunk_ids.append(f"{drawer_id}_chunk_{chunk_idx:06d}")
+                chunk_docs.append(content[i : i + chunk_size])
+                chunk_metas.append(
+                    {**base_meta, "chunk_index": chunk_idx, "parent_drawer_id": drawer_id}
+                )
+            col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+            # Probe the LAST chunk id, not the first — its presence confirms
+            # the whole batch landed, not just the leading row.
+            inserted = col.get(ids=[chunk_ids[-1]], include=[])
+            if not inserted.ids:
+                raise RuntimeError(
+                    "Drawer write was acknowledged but the new ID is not readable. "
+                    "The palace index may be stale; run reconnect or repair."
+                )
+            _metadata_cache = None
+            logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
+            result = {
+                "success": True,
+                "drawer_id": drawer_id,
+                "wing": wing,
+                "room": room,
+                "chunks": len(chunk_ids),
+                "chunk_ids": chunk_ids,
+            }
 
-        # Oversized content: split into bounded per-chunk drawers so the
-        # embedding model never sees a document above ``chunk_size``.
-        # Single batched ``upsert`` so the embedding pass either commits
-        # every chunk or none — no half-written palace if the embedding
-        # model fails mid-loop (#1539).
-        chunk_ids: list[str] = []
-        chunk_docs: list[str] = []
-        chunk_metas: list[dict] = []
-        for i in range(0, len(content), chunk_size):
-            chunk_idx = i // chunk_size
-            chunk_ids.append(f"{drawer_id}_chunk_{chunk_idx:06d}")
-            chunk_docs.append(content[i : i + chunk_size])
-            chunk_metas.append(
-                {**base_meta, "chunk_index": chunk_idx, "parent_drawer_id": drawer_id}
+        # Supersedence hook: link this drawer as successor of an older one.
+        if supersedes_drawer_id:
+            edge_id, warning = _apply_drawer_supersedence(
+                col, drawer_id, supersedes_drawer_id, supersedes_reason or ""
             )
-        col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
-        # Probe the LAST chunk id, not the first — its presence confirms
-        # the whole batch landed, not just the leading row.
-        inserted = col.get(ids=[chunk_ids[-1]], include=[])
-        if not inserted.ids:
-            raise RuntimeError(
-                "Drawer write was acknowledged but the new ID is not readable. "
-                "The palace index may be stale; run reconnect or repair."
-            )
-        _metadata_cache = None
-        logger.info(f"Filed drawer: {drawer_id} → {wing}/{room} ({len(chunk_ids)} chunks)")
-        return {
-            "success": True,
-            "drawer_id": drawer_id,
-            "wing": wing,
-            "room": room,
-            "chunks": len(chunk_ids),
-            "chunk_ids": chunk_ids,
-        }
+            if warning:
+                result["warning"] = warning
+            else:
+                result["supersedence_edge_id"] = edge_id
+
+        return result
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1544,7 +1653,14 @@ def tool_kg_add(
     return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
 
 
-def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
+def tool_kg_invalidate(
+    subject: str,
+    predicate: str,
+    object: str,
+    ended: str = None,
+    successor_subject: str = None,
+    successor_reason: str = None,
+):
     """Mark a fact as no longer true.
 
     Returns the actual ``ended`` date/time that was stored. When the caller
@@ -1553,6 +1669,11 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
 
     Temporal values accept either ``YYYY-MM-DD`` or canonical UTC datetimes in
     the form ``YYYY-MM-DDTHH:MM:SSZ``.
+
+    Optional ``successor_subject`` records that *subject* has been superseded by
+    the named successor entity (via ``mark_superseded``).  ``successor_reason``
+    is stored as the companion ``supersedes_reason`` triple when provided.
+    Omitting both args produces byte-identical behaviour to the previous version.
     """
     try:
         subject = sanitize_kg_value(subject, "subject")
@@ -1575,11 +1696,21 @@ def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = N
     )
 
     _call_kg(lambda kg: kg.invalidate(subject, predicate, object, ended=resolved_ended))
-    return {
+    result = {
         "success": True,
         "fact": f"{subject} → {predicate} → {object}",
         "ended": resolved_ended,
     }
+
+    if successor_subject is not None:
+        _call_kg(
+            lambda kg: kg.mark_superseded(
+                subject, successor_subject, reason=successor_reason, when=resolved_ended
+            )
+        )
+        result["superseded_by"] = successor_subject
+
+    return result
 
 
 def tool_kg_timeline(entity: str = None):
@@ -2065,6 +2196,14 @@ TOOLS = {
                     "type": "string",
                     "description": "When it stopped being true (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ, default: today)",
                 },
+                "successor_subject": {
+                    "type": "string",
+                    "description": "Optional: entity that supersedes *subject* (records a superseded_by KG triple).",
+                },
+                "successor_reason": {
+                    "type": "string",
+                    "description": "Optional: human-readable reason for the supersedence (stored as a companion triple).",
+                },
             },
             "required": ["subject", "predicate", "object"],
         },
@@ -2181,6 +2320,53 @@ TOOLS = {
         },
         "handler": tool_follow_tunnels,
     },
+    "mempalace_mark_superseded": {
+        "description": (
+            "Mark an existing drawer as superseded by a newer one. "
+            "Creates a directed supersedes edge and stamps the predecessor with status=superseded."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "old_drawer_id": {
+                    "type": "string",
+                    "description": "ID of the drawer that is now outdated",
+                },
+                "new_drawer_id": {
+                    "type": "string",
+                    "description": "ID of the drawer that replaces it",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Human-readable reason for the supersedence (optional)",
+                },
+            },
+            "required": ["old_drawer_id", "new_drawer_id"],
+        },
+        "handler": tool_mark_superseded,
+    },
+    "mempalace_list_supersedence": {
+        "description": (
+            "List supersedence edges for a drawer. "
+            "Returns {superseded_by: [...], supersedes: [...]} edges."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "drawer_id": {
+                    "type": "string",
+                    "description": "Drawer ID to look up",
+                },
+                "direction": {
+                    "type": "string",
+                    "description": "both (default), outgoing, or incoming",
+                    "enum": ["both", "outgoing", "incoming"],
+                },
+            },
+            "required": ["drawer_id"],
+        },
+        "handler": tool_list_supersedence,
+    },
     "mempalace_search": {
         "description": "Semantic search. Returns verbatim drawer content with similarity scores. IMPORTANT: 'query' must contain ONLY search keywords. Use 'context' for background. Results with cosine distance > max_distance are filtered out.",
         "input_schema": {
@@ -2206,6 +2392,14 @@ TOOLS = {
                 "context": {
                     "type": "string",
                     "description": "Background context for the search (optional). NOT used for embedding — only for future re-ranking.",
+                },
+                "include_superseded": {
+                    "type": "boolean",
+                    "description": "Include drawers whose status is 'superseded' (default false — they are hidden by default).",
+                },
+                "follow_supersedes": {
+                    "type": "boolean",
+                    "description": "Attach superseded_by/supersedes edge backrefs to result rows (default true).",
                 },
             },
             "required": ["query"],

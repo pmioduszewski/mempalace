@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .backends import CollectionNotInitializedError, PalaceNotFoundError
 from .palace import get_closets_collection, get_collection
+from . import palace_graph  # module ref needed for monkeypatching in tests
 
 # Closet pointer line format: "topic|entities|→drawer_id_a,drawer_id_b"
 # Multiple lines may join with newlines inside one closet document.
@@ -596,6 +597,7 @@ def _bm25_only_via_sqlite(
                 "similarity": None,
                 "distance": None,
                 "matched_via": "bm25_sqlite",
+                "status": meta.get("status"),
                 # Internal: full path + chunk_index let callers (notably
                 # candidate_strategy="union") dedupe at chunk granularity
                 # rather than basename — two files in different directories
@@ -642,6 +644,7 @@ def _merge_bm25_union_candidates(
     room: str,
     n_results: int,
     max_distance: float = 0.0,
+    include_superseded: bool = False,
 ) -> None:
     """Append top-K BM25-only candidates from sqlite into ``hits`` in place.
 
@@ -664,6 +667,10 @@ def _merge_bm25_union_candidates(
     distance to satisfy the threshold, and silently injecting them would
     break the existing ``max_distance`` guarantee that hybrid results lie
     within the requested vector-distance bound.
+
+    ``include_superseded`` mirrors the same parameter in ``search_memories``:
+    when False (default), superseded BM25 candidates are filtered out here
+    so they cannot re-enter results through the union path.
     """
     if max_distance > 0.0:
         return
@@ -696,11 +703,211 @@ def _merge_bm25_union_candidates(
         key = _dedup_key(bh)
         if not key or key == "?" or key in seen:
             continue
+        # Apply the same superseded filter as the vector path PRE-TRIM.
+        if not include_superseded and bh.get("status") == "superseded":
+            continue
         bh["distance"] = None
         bh["effective_distance"] = None
         bh["closet_boost"] = 0.0
         hits.append(bh)
         seen.add(key)
+
+
+def _build_drawer_row(
+    doc: str,
+    meta: dict,
+    dist: float,
+    drawer_id,
+    closet_boost_by_source: dict,
+    closet_rank_boosts: list,
+    closet_distance_cap: float,
+) -> dict:
+    """Build one result entry dict from raw chroma fields + closet boost lookup.
+
+    Extracted to keep search_memories under the mccabe-25 complexity ceiling.
+    """
+    source = meta.get("source_file", "") or ""
+    boost = 0.0
+    matched_via = "drawer"
+    closet_preview = None
+    if source in closet_boost_by_source:
+        c_rank, c_dist, c_preview = closet_boost_by_source[source]
+        if c_dist <= closet_distance_cap and c_rank < len(closet_rank_boosts):
+            boost = closet_rank_boosts[c_rank]
+            matched_via = "drawer+closet"
+            closet_preview = c_preview
+
+    effective_dist = max(0.0, min(2.0, dist - boost))
+    entry = {
+        "text": doc,
+        "wing": meta.get("wing", "unknown"),
+        "room": meta.get("room", "unknown"),
+        "source_file": Path(source).name if source else "?",
+        "created_at": meta.get("filed_at", "unknown"),
+        "similarity": round(max(0.0, 1 - effective_dist), 3),
+        "distance": round(dist, 4),
+        "effective_distance": round(effective_dist, 4),
+        "closet_boost": round(boost, 3),
+        "matched_via": matched_via,
+        "drawer_id": drawer_id,
+        "status": meta.get("status"),
+        "_sort_key": effective_dist,
+        "_source_file_full": source,
+        "_chunk_index": meta.get("chunk_index"),
+    }
+    if closet_preview:
+        entry["closet_preview"] = closet_preview
+    return entry
+
+
+def _apply_supersedence(
+    hits: list,
+    include_superseded: bool,
+    follow_supersedes: bool,
+) -> list:
+    """Post-trim: attach superseded_by/supersedes backrefs and set state on each row.
+
+    Loads all supersedence edges ONCE (one tunnels.json read for the whole
+    batch) and indexes by drawer_id — no per-row tunnel reads.
+
+    ``include_superseded`` should have already been applied PRE-TRIM; this
+    helper just adds the backref annotations and state field. If somehow a
+    superseded row survived (include_superseded=True), it is left as-is with
+    state="superseded".
+
+    Returns the (possibly filtered) list; does NOT mutate caller's list in
+    place — returns a new list.
+    """
+    if not hits:
+        return hits
+
+    # Load all edges once and index by drawer_id.
+    all_edges = {}
+    if follow_supersedes:
+        try:
+            # _load_tunnels returns raw list; filter supersedes kind
+            raw = palace_graph._load_tunnels()
+            for edge in raw:
+                if edge.get("kind") != "supersedes":
+                    continue
+                pred_id = (edge.get("predecessor") or {}).get("drawer_id")
+                succ_id = (edge.get("successor") or {}).get("drawer_id")
+                if pred_id:
+                    all_edges.setdefault(pred_id, {"superseded_by": [], "supersedes": []})
+                    all_edges[pred_id]["superseded_by"].append(edge)
+                if succ_id:
+                    all_edges.setdefault(succ_id, {"superseded_by": [], "supersedes": []})
+                    all_edges[succ_id]["supersedes"].append(edge)
+        except Exception:
+            logger.debug("_apply_supersedence: edge load failed", exc_info=True)
+
+    result = []
+    for row in hits:
+        drawer_id = row.get("drawer_id", "")
+        # Consume the internal 'status' field; surface it as 'state'.
+        status = row.pop("status", None)
+        row["state"] = "superseded" if status == "superseded" else "current"
+
+        if follow_supersedes and drawer_id in all_edges:
+            edges_for = all_edges[drawer_id]
+            if edges_for["superseded_by"]:
+                row["superseded_by"] = edges_for["superseded_by"]
+            if edges_for["supersedes"]:
+                row["supersedes"] = edges_for["supersedes"]
+
+        result.append(row)
+    return result
+
+
+# ── Entity-level supersedence annotation (D1) ────────────────────────────────
+# Bounds: cap KG names scanned and matches recorded per row to keep the
+# per-search cost O(rows × min(superseded_names, cap)).
+_MAX_SUPERSEDED_ENTITY_NAMES = 200
+_MAX_SUPERSEDED_PER_ROW = 5
+
+
+def _kg_path_for_palace(palace_path: str) -> str:
+    """Resolve the KG sqlite path for *palace_path*.
+
+    Resolution order:
+      1. ``<palace_path>/knowledge_graph.sqlite3`` — co-located KG (used when
+         the MCP server was started with ``--palace``).
+      2. ``~/.mempalace/knowledge_graph.sqlite3`` (``DEFAULT_KG_PATH``) — the
+         global default when no palace-specific KG exists.
+
+    Tests monkeypatch this function to inject an isolated sqlite file.
+    """
+    from .knowledge_graph import DEFAULT_KG_PATH  # lazy import — KG is optional
+
+    co_located = os.path.join(palace_path, "knowledge_graph.sqlite3")
+    if os.path.isfile(co_located):
+        return co_located
+    return DEFAULT_KG_PATH
+
+
+def _annotate_superseded_entities(hits: list, palace_path: str) -> None:
+    """Mutate each row in *hits* to add ``superseded_entities`` when its text
+    mentions a KG-superseded entity name (word-boundary, case-insensitive).
+
+    Performance contract (1 search = 1 sqlite read):
+        - ``current_supersessions()`` is called ONCE for the whole batch.
+        - Capped at ``_MAX_SUPERSEDED_ENTITY_NAMES`` entity names scanned.
+        - Capped at ``_MAX_SUPERSEDED_PER_ROW`` matches recorded per row.
+
+    Annotation only — never filters or suppresses rows.  On any failure
+    (KG absent, schema mismatch, import error …) the function silently
+    returns without touching the rows, preserving the OSS "no KG required"
+    contract.
+    """
+    if not hits:
+        return
+    try:
+        from .knowledge_graph import KnowledgeGraph
+
+        kg_path = _kg_path_for_palace(palace_path)
+        if not Path(kg_path).exists():
+            return
+
+        kg = KnowledgeGraph(db_path=kg_path)
+        try:
+            supersessions = kg.current_supersessions()
+        finally:
+            kg.close()
+
+        if not supersessions:
+            return
+
+        # Build a list of (old_name, new_name, reason, compiled_regex) capped at the bound.
+        # Skip entity ids shorter than 3 chars — single-letter or two-char ids
+        # produce noisy word-boundary matches against common words and abbreviations.
+        patterns: list[tuple[str, str, str | None, re.Pattern]] = []
+        for old_id, info in list(supersessions.items())[:_MAX_SUPERSEDED_ENTITY_NAMES]:
+            if len(old_id) < 3:
+                continue
+            # current_supersessions keys are lowercased entity ids.
+            # We need the original display name for the annotation; fall back to the key.
+            old_display = old_id  # the key IS the lowercase name (entity id == lowercased name)
+            new_name = info["new"]
+            reason = info.get("reason")
+            # Word-boundary regex; re.escape handles dots (e.g. "oldbrand.com").
+            pattern = re.compile(r"\b" + re.escape(old_display) + r"\b", re.IGNORECASE)
+            patterns.append((old_display, new_name, reason, pattern))
+
+        for row in hits:
+            text = row.get("text") or ""
+            text_lower = text.lower()
+            matches: list[dict] = []
+            for old_display, new_name, reason, pattern in patterns:
+                if len(matches) >= _MAX_SUPERSEDED_PER_ROW:
+                    break
+                if pattern.search(text_lower):
+                    matches.append({"old": old_display, "new": new_name, "reason": reason})
+            if matches:
+                row["superseded_entities"] = matches
+
+    except Exception:
+        # Any failure (missing file, schema mismatch, import error) → skip silently.
+        logger.debug("_annotate_superseded_entities: skipped", exc_info=True)
 
 
 # Strategy dispatch — keeps search_memories' branch count under the
@@ -734,6 +941,7 @@ def _apply_candidate_strategy(
     room: str,
     n_results: int,
     max_distance: float = 0.0,
+    include_superseded: bool = False,
 ) -> None:
     """Dispatch to the registered merger for ``strategy``.
 
@@ -742,7 +950,16 @@ def _apply_candidate_strategy(
     """
     merger = _CANDIDATE_MERGERS[strategy]
     if merger is not None:
-        merger(hits, query, palace_path, wing, room, n_results, max_distance=max_distance)
+        merger(
+            hits,
+            query,
+            palace_path,
+            wing,
+            room,
+            n_results,
+            max_distance=max_distance,
+            include_superseded=include_superseded,
+        )
 
 
 def search_memories(
@@ -755,6 +972,8 @@ def search_memories(
     vector_disabled: bool = False,
     candidate_strategy: str = "vector",
     collection_name: str = None,
+    include_superseded: bool = False,
+    follow_supersedes: bool = True,
 ) -> dict:
     """Programmatic search — returns a dict instead of printing.
 
@@ -799,14 +1018,24 @@ def search_memories(
     _validate_candidate_strategy(candidate_strategy)
 
     if vector_disabled:
-        return _bm25_only_via_sqlite(
+        result = _bm25_only_via_sqlite(
             query,
             palace_path,
             wing=wing,
             room=room,
-            n_results=n_results,
+            n_results=n_results * 3 if not include_superseded else n_results,
             collection_name=collection_name,
         )
+        # Apply the same superseded filter + state stamping as the vector
+        # path.  ``_bm25_only_via_sqlite`` now carries ``status`` on every
+        # row; ``_apply_supersedence`` consumes it and stamps ``state``.
+        raw_hits = result.get("results", [])
+        if not include_superseded:
+            raw_hits = [h for h in raw_hits if h.get("status") != "superseded"]
+        raw_hits = raw_hits[:n_results]
+        filtered = _apply_supersedence(raw_hits, include_superseded, follow_supersedes)
+        result["results"] = filtered
+        return result
 
     try:
         drawers_col = get_collection(palace_path, collection_name=collection_name, create=False)
@@ -868,14 +1097,17 @@ def search_memories(
     # Rank-based boost. The ordinal signal ("which closet matched best") is
     # more reliable than absolute distance on narrative content, where
     # closet distances cluster in 1.2-1.5 range regardless of match quality.
-    CLOSET_RANK_BOOSTS = [0.40, 0.25, 0.15, 0.08, 0.04]
-    CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
+    _CLOSET_RANK_BOOSTS = [0.40, 0.25, 0.15, 0.08, 0.04]
+    _CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
-    for doc, meta, dist in zip(
-        _first_or_empty(drawer_results, "documents"),
-        _first_or_empty(drawer_results, "metadatas"),
-        _first_or_empty(drawer_results, "distances"),
+    _drawer_ids = _first_or_empty(drawer_results, "ids")
+    for _i, (doc, meta, dist) in enumerate(
+        zip(
+            _first_or_empty(drawer_results, "documents"),
+            _first_or_empty(drawer_results, "metadatas"),
+            _first_or_empty(drawer_results, "distances"),
+        )
     ):
         meta = meta or {}
         doc = doc or ""
@@ -883,45 +1115,23 @@ def search_memories(
         if max_distance > 0.0 and dist > max_distance:
             continue
 
-        meta = meta or {}
-        source = meta.get("source_file", "") or ""
-        boost = 0.0
-        matched_via = "drawer"
-        closet_preview = None
-        if source in closet_boost_by_source:
-            c_rank, c_dist, c_preview = closet_boost_by_source[source]
-            if c_dist <= CLOSET_DISTANCE_CAP and c_rank < len(CLOSET_RANK_BOOSTS):
-                boost = CLOSET_RANK_BOOSTS[c_rank]
-                matched_via = "drawer+closet"
-                closet_preview = c_preview
+        # PRE-TRIM superseded filter (R3): run before trimming to n_results so
+        # the default result count is not silently shrunk.
+        if not include_superseded and meta.get("status") == "superseded":
+            continue
 
-        # Clamp to the valid cosine-distance range [0, 2]. When a strong
-        # closet boost (up to 0.40) exceeds the raw distance, the subtraction
-        # can go negative — which (a) yields ``similarity > 1.0`` downstream
-        # and (b) makes the sort key land *below* ordinary positive distances,
-        # inverting the ranking so the best hybrid matches sort last.
-        effective_dist = max(0.0, min(2.0, dist - boost))
-        entry = {
-            "text": doc,
-            "wing": meta.get("wing", "unknown"),
-            "room": meta.get("room", "unknown"),
-            "source_file": Path(source).name if source else "?",
-            "created_at": meta.get("filed_at", "unknown"),
-            "similarity": round(max(0.0, 1 - effective_dist), 3),
-            "distance": round(dist, 4),
-            "effective_distance": round(effective_dist, 4),
-            "closet_boost": round(boost, 3),
-            "matched_via": matched_via,
-            # Internal: retain the full source_file path + chunk_index so the
-            # enrichment step below doesn't have to reverse-lookup via
-            # basename-suffix matching (which silently collides when two
-            # files share a basename across different directories).
-            "_sort_key": effective_dist,
-            "_source_file_full": source,
-            "_chunk_index": meta.get("chunk_index"),
-        }
-        if closet_preview:
-            entry["closet_preview"] = closet_preview
+        # Thread chroma drawer_id: ids are always returned by chroma even when
+        # not listed in include= (Delta #6 — verified; ids are always present).
+        did = _drawer_ids[_i] if _i < len(_drawer_ids) else None
+        entry = _build_drawer_row(
+            doc,
+            meta,
+            dist,
+            did,
+            closet_boost_by_source,
+            _CLOSET_RANK_BOOSTS,
+            _CLOSET_DISTANCE_CAP,
+        )
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
@@ -988,7 +1198,10 @@ def search_memories(
     # BM25 candidates from sqlite. See `_apply_candidate_strategy`.
     # ``max_distance`` is forwarded so union mode can refuse to inject
     # BM25-only (distance=None) candidates that would silently bypass the
-    # caller's strict distance threshold.
+    # caller's strict distance threshold.  ``include_superseded`` is
+    # forwarded so the union path applies the same superseded filter as the
+    # vector PRE-TRIM path — without it, superseded drawers with strong BM25
+    # signal re-enter results and get mislabelled state="current".
     _apply_candidate_strategy(
         candidate_strategy,
         hits,
@@ -998,6 +1211,7 @@ def search_memories(
         room,
         n_results,
         max_distance=max_distance,
+        include_superseded=include_superseded,
     )
 
     # BM25 hybrid re-rank within the final candidate set, then trim back
@@ -1010,6 +1224,15 @@ def search_memories(
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)
         h.pop("_chunk_index", None)
+
+    # Post-trim: attach superseded_by/supersedes backrefs and set state.
+    # _apply_supersedence reads and removes the internal 'status' field.
+    hits = _apply_supersedence(hits, include_superseded, follow_supersedes)
+
+    # Entity-level annotation: flag rows whose text mentions a KG-superseded
+    # entity.  1 sqlite read for the whole batch; bounded by caps in helper.
+    # Silently skipped when no KG file exists (OSS "no KG required" contract).
+    _annotate_superseded_entities(hits, palace_path)
 
     return {
         "query": query,
