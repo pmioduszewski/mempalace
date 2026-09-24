@@ -141,3 +141,83 @@ def test_chunked_predecessor_chunks_are_hidden_after_supersedence(
     assert "old_brand.md" not in returned_sources, (
         f"chunk rows from superseded predecessor must be hidden; got sources={returned_sources}"
     )
+
+
+# ── Reachability: supersedence must work through the MCP tools/call path ──
+# The handler supported it for months, but the tool schema did not declare the
+# argument, and the dispatcher drops undeclared arguments. These tests go
+# through handle_request so that gap cannot reopen.
+
+
+def _call_add_drawer(arguments):
+    import json
+
+    resp = mcp_server.handle_request(
+        {
+            "method": "tools/call",
+            "id": 1,
+            "params": {"name": "mempalace_add_drawer", "arguments": arguments},
+        }
+    )
+    assert "error" not in resp, resp
+    return json.loads(resp["result"]["content"][0]["text"])
+
+
+def test_add_drawer_schema_declares_supersedence():
+    props = mcp_server.TOOLS["mempalace_add_drawer"]["input_schema"]["properties"]
+    assert props["supersedes_drawer_ids"]["type"] == "array"
+    assert "supersedes_reason" in props
+
+
+def test_tools_call_add_drawer_supersedes_many_in_one_call(
+    monkeypatch, config, palace_path, kg, tmp_path
+):
+    _wire(monkeypatch, config)
+    monkeypatch.setattr(
+        mcp_server.palace_graph, "_get_tunnel_file", lambda *a, **k: str(tmp_path / "tunnels.json")
+    )
+    a = mcp_server.tool_add_drawer("tooling", "email", "mailbox X is not connected")
+    b = mcp_server.tool_add_drawer("tooling", "email", "search across all mailboxes crashes")
+    new = _call_add_drawer(
+        {
+            "wing": "tooling",
+            "room": "email",
+            "content": "mailbox X works; search across all mailboxes fixed",
+            "supersedes_drawer_ids": [a["drawer_id"], b["drawer_id"]],
+            "supersedes_reason": "fixed and verified",
+        }
+    )
+    assert new["success"] is True
+    assert len(new["supersedence_edge_ids"]) == 2
+    for old in (a, b):
+        meta = mcp_server.tool_get_drawer(old["drawer_id"])["metadata"]
+        assert meta["status"] == "superseded"
+        assert meta["superseded_by_id"] == new["drawer_id"]
+
+
+def test_pure_chunked_predecessor_superseded_by_logical_id(
+    monkeypatch, config, palace_path, kg, tmp_path
+):
+    """Real palace shape: a long drawer has ONLY chunk rows, no row at its
+    logical id. Superseding by the logical id must work and hide every chunk."""
+    _wire(monkeypatch, config)
+    monkeypatch.setattr(
+        mcp_server.palace_graph, "_get_tunnel_file", lambda *a, **k: str(tmp_path / "tunnels.json")
+    )
+    col = mcp_server._get_collection(create=True)
+    pred_logical = "drawer_pure_chunked_xyz"
+    chunk_ids = [f"{pred_logical}_chunk_{i:06d}" for i in range(2)]
+    col.upsert(
+        ids=chunk_ids,
+        documents=["stale rule part one", "stale rule part two"],
+        metadatas=[
+            {"wing": "notes", "room": "rules", "chunk_index": i, "parent_drawer_id": pred_logical}
+            for i in range(2)
+        ],
+    )
+    new = mcp_server.tool_add_drawer("notes", "rules", "current rule")
+    edge = mcp_server.tool_mark_superseded(pred_logical, new["drawer_id"], reason="updated")
+    assert edge["kind"] == "supersedes"
+    metas = col.get(ids=chunk_ids, include=["metadatas"])["metadatas"]
+    assert all(m["status"] == "superseded" for m in metas)
+    assert all(m["superseded_by_id"] == new["drawer_id"] for m in metas)

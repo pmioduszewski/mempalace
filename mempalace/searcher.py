@@ -681,7 +681,7 @@ def _merge_bm25_union_candidates(
             palace_path,
             wing=wing,
             room=room,
-            n_results=n_results * 3,
+            n_results=_rerank_pool_size(n_results),
             _include_internal=True,
         ).get("results", [])
     except Exception:
@@ -823,6 +823,16 @@ def _apply_supersedence(
 # Bounds: cap KG names scanned and matches recorded per row to keep the
 # per-search cost O(rows × min(superseded_names, cap)).
 _MAX_SUPERSEDED_ENTITY_NAMES = 200
+
+# Minimum size of the candidate pool the hybrid re-rank sees. Sizing the pool
+# as n_results * 3 alone is too small for short queries (limit 4 -> 12 rows):
+# a drawer that the re-rank would put at #1 is never fetched, and superseded
+# rows that are filtered out later still occupy pool slots.
+_MIN_RERANK_POOL = 50
+
+
+def _rerank_pool_size(n_results: int) -> int:
+    return max(n_results * 3, _MIN_RERANK_POOL)
 _MAX_SUPERSEDED_PER_ROW = 5
 
 
@@ -1023,7 +1033,7 @@ def search_memories(
             palace_path,
             wing=wing,
             room=room,
-            n_results=n_results * 3 if not include_superseded else n_results,
+            n_results=_rerank_pool_size(n_results) if not include_superseded else n_results,
             collection_name=collection_name,
         )
         # Apply the same superseded filter + state stamping as the vector
@@ -1058,7 +1068,7 @@ def search_memories(
     try:
         dkwargs = {
             "query_texts": [query],
-            "n_results": n_results * 3,  # over-fetch for re-ranking
+            "n_results": _rerank_pool_size(n_results),  # over-fetch for re-ranking
             "include": ["documents", "metadatas", "distances"],
         }
         if where:
@@ -1135,9 +1145,41 @@ def search_memories(
         scored.append(entry)
 
     scored.sort(key=lambda h: h["_sort_key"])
-    hits = scored[:n_results]
+    # Keep the whole pool for the BM25 re-rank below. Trimming to n_results
+    # here meant the re-rank only reshuffled the vector top-n and could never
+    # promote a stronger keyword match from deeper in the pool.
+    hits = scored[: _rerank_pool_size(n_results)]
 
-    # Drawer-grep enrichment: for closet-boosted hits whose source has
+    # Candidate strategy hook: optionally widen the rerank pool's *source*
+    # before ranking. Default ("vector") is a no-op; "union" merges top-K
+    # BM25 candidates from sqlite. See `_apply_candidate_strategy`.
+    # ``max_distance`` is forwarded so union mode can refuse to inject
+    # BM25-only (distance=None) candidates that would silently bypass the
+    # caller's strict distance threshold.  ``include_superseded`` is
+    # forwarded so the union path applies the same superseded filter as the
+    # vector PRE-TRIM path: without it, superseded drawers with strong BM25
+    # signal re-enter results and get mislabelled state="current".
+    _apply_candidate_strategy(
+        candidate_strategy,
+        hits,
+        query,
+        palace_path,
+        wing,
+        room,
+        n_results,
+        max_distance=max_distance,
+        include_superseded=include_superseded,
+    )
+
+    # BM25 hybrid re-rank within the final candidate set, then trim back
+    # to the requested size. Without the trim, ``candidate_strategy="union"``
+    # would return up to 4× ``n_results`` (vector hits + BM25 union pool),
+    # breaking the existing ``search_memories`` size contract that the MCP
+    # ``limit`` parameter is built on.
+    hits = _hybrid_rank(hits, query)[:n_results]
+
+    # Drawer-grep enrichment (after the final trim, so only returned hits pay
+    # for hydration): for closet-boosted hits whose source has
     # multiple drawers, return the keyword-best chunk + its immediate
     # neighbors instead of just the drawer vector search landed on. The
     # closet said "this source is relevant"; vector may have picked the
@@ -1193,33 +1235,6 @@ def search_memories(
         h["drawer_index"] = best_idx
         h["total_drawers"] = len(ordered_docs)
 
-    # Candidate strategy hook: optionally widen the rerank pool's *source*
-    # before ranking. Default ("vector") is a no-op; "union" merges top-K
-    # BM25 candidates from sqlite. See `_apply_candidate_strategy`.
-    # ``max_distance`` is forwarded so union mode can refuse to inject
-    # BM25-only (distance=None) candidates that would silently bypass the
-    # caller's strict distance threshold.  ``include_superseded`` is
-    # forwarded so the union path applies the same superseded filter as the
-    # vector PRE-TRIM path — without it, superseded drawers with strong BM25
-    # signal re-enter results and get mislabelled state="current".
-    _apply_candidate_strategy(
-        candidate_strategy,
-        hits,
-        query,
-        palace_path,
-        wing,
-        room,
-        n_results,
-        max_distance=max_distance,
-        include_superseded=include_superseded,
-    )
-
-    # BM25 hybrid re-rank within the final candidate set, then trim back
-    # to the requested size. Without the trim, ``candidate_strategy="union"``
-    # would return up to 4× ``n_results`` (vector hits + BM25 union pool),
-    # breaking the existing ``search_memories`` size contract that the MCP
-    # ``limit`` parameter is built on.
-    hits = _hybrid_rank(hits, query)[:n_results]
     for h in hits:
         h.pop("_sort_key", None)
         h.pop("_source_file_full", None)

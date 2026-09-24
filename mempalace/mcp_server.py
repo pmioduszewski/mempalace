@@ -1111,11 +1111,13 @@ def tool_mark_superseded(old_drawer_id: str, new_drawer_id: str, reason: str = "
     col = _get_collection()
     if not col:
         return _no_palace()
-    # Verify both drawers exist.
+    # Verify both drawers exist (a chunked drawer exists only as chunk rows).
     for did in (old_drawer_id, new_drawer_id):
         probe = col.get(ids=[did], include=[])
         if not probe["ids"]:
-            return {"error": f"Drawer not found: {did}"}
+            chunks = col.get(where={"parent_drawer_id": did}, include=[])
+            if not chunks["ids"]:
+                return {"error": f"Drawer not found: {did}"}
     edge_id, warning = _apply_drawer_supersedence(col, new_drawer_id, old_drawer_id, reason)
     if warning:
         return {"error": warning}
@@ -1143,9 +1145,15 @@ def _apply_drawer_supersedence(col, new_id: str, pred_id: str, reason: str):
     """
     try:
         probe = col.get(ids=[pred_id], include=["metadatas"])
-        if not probe["ids"]:
+        # A chunked drawer has no row under its logical id, only chunk rows
+        # carrying parent_drawer_id. Accept the logical id as a predecessor.
+        chunk_probe = col.get(where={"parent_drawer_id": pred_id}, include=["metadatas"])
+        if not probe["ids"] and not chunk_probe["ids"]:
             return None, f"Predecessor drawer not found: {pred_id}; supersedence edge not created."
-        pred_meta = (probe["metadatas"] or [{}])[0] or {}
+        if probe["ids"]:
+            pred_meta = (probe["metadatas"] or [{}])[0] or {}
+        else:
+            pred_meta = (chunk_probe["metadatas"] or [{}])[0] or {}
         pred_wing = pred_meta.get("wing", "")
         pred_room = pred_meta.get("room", "")
         new_meta = col.get(ids=[new_id], include=["metadatas"])
@@ -1166,8 +1174,9 @@ def _apply_drawer_supersedence(col, new_id: str, pred_id: str, reason: str):
             "superseded_at": date.today().isoformat(),
             "superseded_by_id": new_id,
         }
-        merged_meta = {**pred_meta, **superseded_stamp}
-        col.update(ids=[pred_id], metadatas=[merged_meta])
+        if probe["ids"]:
+            merged_meta = {**pred_meta, **superseded_stamp}
+            col.update(ids=[pred_id], metadatas=[merged_meta])
 
         # Stamp chunk rows for oversized predecessors.  Query by
         # parent_drawer_id so we don't need to know the chunk count.
@@ -1201,6 +1210,7 @@ def tool_add_drawer(
     added_by: str = "mcp",
     supersedes_drawer_id: str = None,
     supersedes_reason: str = None,
+    supersedes_drawer_ids: list = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first.
 
@@ -1333,15 +1343,25 @@ def tool_add_drawer(
                 "chunk_ids": chunk_ids,
             }
 
-        # Supersedence hook: link this drawer as successor of an older one.
-        if supersedes_drawer_id:
+        # Supersedence hook: link this drawer as successor of older ones,
+        # in the same call, so a correction never leaves two "current" facts.
+        preds = list(supersedes_drawer_ids or [])
+        if supersedes_drawer_id and supersedes_drawer_id not in preds:
+            preds.insert(0, supersedes_drawer_id)
+        edge_ids, warnings = [], []
+        for pred in preds:
             edge_id, warning = _apply_drawer_supersedence(
-                col, drawer_id, supersedes_drawer_id, supersedes_reason or ""
+                col, drawer_id, pred, supersedes_reason or ""
             )
             if warning:
-                result["warning"] = warning
+                warnings.append(warning)
             else:
-                result["supersedence_edge_id"] = edge_id
+                edge_ids.append(edge_id)
+        if edge_ids:
+            result["supersedence_edge_id"] = edge_ids[0]
+            result["supersedence_edge_ids"] = edge_ids
+        if warnings:
+            result["warning"] = "; ".join(warnings)
 
         return result
     except Exception as e:
@@ -2437,6 +2457,20 @@ TOOLS = {
                 },
                 "source_file": {"type": "string", "description": "Where this came from (optional)"},
                 "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
+                "supersedes_drawer_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "IDs of older drawers this one corrects, updates or replaces. "
+                        "They are marked superseded in the same call and hidden from search. "
+                        "Search first; if a drawer on the same fact exists and this changes it, "
+                        "pass its ID here instead of leaving two conflicting 'current' drawers."
+                    ),
+                },
+                "supersedes_reason": {
+                    "type": "string",
+                    "description": "Why the old drawer(s) no longer hold (optional, stored on the edge)",
+                },
             },
             "required": ["wing", "room", "content"],
         },
